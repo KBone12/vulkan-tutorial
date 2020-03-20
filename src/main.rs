@@ -7,6 +7,12 @@ use vulkano::{
     },
 };
 
+use winit::{
+    event::{Event, WindowEvent},
+    event_loop::{ControlFlow, EventLoop},
+    window::WindowBuilder,
+};
+
 fn main() {
     println!("=== Layers ===");
     layers_list().unwrap().for_each(|layer| {
@@ -81,6 +87,9 @@ fn main() {
         .ok();
     }
 
+    let event_loop = EventLoop::new();
+    let _window = WindowBuilder::new().build(&event_loop).unwrap();
+
     println!("=== Devices ===");
     PhysicalDevice::enumerate(&instance).for_each(|device| {
         println!("{} (index: {})", device.name(), device.index());
@@ -113,4 +122,17 @@ fn main() {
         })
         .next()
         .expect("Could not find any GPU");
+
+    event_loop.run(|event, _, control_flow| {
+        *control_flow = ControlFlow::Wait;
+        match event {
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => {
+                *control_flow = ControlFlow::Exit;
+            }
+            _ => {}
+        };
+    });
 }
