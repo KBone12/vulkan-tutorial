@@ -93,23 +93,24 @@ fn main() {
     });
 
     // Pick the logical device which supports graphics
-    let _device = PhysicalDevice::enumerate(&instance)
+    let (_device, _queues) = PhysicalDevice::enumerate(&instance)
         .filter_map(|device| {
             // Pick the physical device which supports graphics
             device
                 .queue_families()
-                .filter(|queue| queue.supports_graphics())
-                .map(|queue| (device, queue))
+                .filter(|queue_family| queue_family.supports_graphics())
+                .map(|queue_family| (device, queue_family))
                 .next()
         })
-        .next()
-        .map(|(device, queue)| {
+        .filter_map(|(device, queue_family)| {
             Device::new(
                 device,
                 &Features::none(),
                 &DeviceExtensions::supported_by_device(device),
-                Some((queue, 1.0)),
+                vec![(queue_family, 1.0)],
             )
+            .ok()
         })
+        .next()
         .expect("Could not find any GPU");
 }
