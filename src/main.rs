@@ -88,7 +88,7 @@ fn main() {
     }
 
     let event_loop = EventLoop::new();
-    let _surface = WindowBuilder::new()
+    let surface = WindowBuilder::new()
         .build_vk_surface(&event_loop, instance.clone())
         .unwrap();
 
@@ -103,27 +103,45 @@ fn main() {
         println!("Type: {:?}", device.ty());
     });
 
-    // Pick the logical device which supports graphics
-    let (_device, _queues) = PhysicalDevice::enumerate(&instance)
+    let (_device, mut queues) = PhysicalDevice::enumerate(&instance)
         .filter_map(|device| {
-            // Pick the physical device which supports graphics
-            device
+            let graphics_queue_family = device
                 .queue_families()
-                .filter(|queue_family| queue_family.supports_graphics())
-                .map(|queue_family| (device, queue_family))
-                .next()
+                .find(|queue_family| queue_family.supports_graphics());
+            let present_queue_family = device
+                .queue_families()
+                .find(|queue_family| surface.is_supported(*queue_family) == Ok(true));
+            graphics_queue_family
+                .and(present_queue_family)
+                .and_then(|_| {
+                    Some((
+                        device,
+                        vec![
+                            graphics_queue_family.unwrap(),
+                            present_queue_family.unwrap(),
+                        ],
+                    ))
+                })
         })
-        .filter_map(|(device, queue_family)| {
+        .filter_map(|(device, queue_families)| {
             Device::new(
                 device,
                 &Features::none(),
                 &DeviceExtensions::supported_by_device(device),
-                vec![(queue_family, 1.0)],
+                queue_families
+                    .iter()
+                    .map(|queue_family| (*queue_family, 1.0)),
             )
             .ok()
         })
         .next()
         .expect("Could not find any GPU");
+    let _graphics_queue = queues
+        .find(|queue| queue.family().supports_graphics())
+        .unwrap();
+    let _present_queue = queues
+        .find(|queue| surface.is_supported(queue.family()) == Ok(true))
+        .unwrap();
 
     event_loop.run(|event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
