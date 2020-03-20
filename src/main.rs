@@ -1,5 +1,6 @@
 use vulkano::{
     app_info_from_cargo_toml,
+    device::{Device, DeviceExtensions, Features},
     instance::{
         debug::{DebugCallback, MessageSeverity, MessageType},
         layers_list, Instance, InstanceExtensions, PhysicalDevice,
@@ -19,10 +20,11 @@ fn main() {
 
     // Create a Vulkan instance
     let app_info = app_info_from_cargo_toml!();
+    let extensions = InstanceExtensions::supported_by_core().unwrap();
     let instance = if cfg!(debug_assertions) {
         let extensions = InstanceExtensions {
             ext_debug_utils: true,
-            ..InstanceExtensions::none()
+            ..extensions
         };
 
         // Load validation layers
@@ -41,7 +43,7 @@ fn main() {
             supported_validation_layers.iter().map(|layer| layer.name()),
         )
     } else {
-        Instance::new(Some(&app_info), &InstanceExtensions::none(), None)
+        Instance::new(Some(&app_info), &extensions, None)
     };
     let instance = instance.expect("Could not build a Vulkan instance");
 
@@ -89,4 +91,25 @@ fn main() {
         );
         println!("Type: {:?}", device.ty());
     });
+
+    // Pick the logical device which supports graphics
+    let _device = PhysicalDevice::enumerate(&instance)
+        .filter_map(|device| {
+            // Pick the physical device which supports graphics
+            device
+                .queue_families()
+                .filter(|queue| queue.supports_graphics())
+                .map(|queue| (device, queue))
+                .next()
+        })
+        .next()
+        .map(|(device, queue)| {
+            Device::new(
+                device,
+                &Features::none(),
+                &DeviceExtensions::supported_by_device(device),
+                Some((queue, 1.0)),
+            )
+        })
+        .expect("Could not find any GPU");
 }
