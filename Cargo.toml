@@ -8,4 +8,5 @@ edition = "2018"
 
 [dependencies]
 vulkano = "0.18.0"
+vulkano-win = "0.18.0"
 winit = "0.22.0"

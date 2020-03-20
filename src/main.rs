@@ -6,7 +6,7 @@ use vulkano::{
         layers_list, Instance, InstanceExtensions, PhysicalDevice,
     },
 };
-
+use vulkano_win::{required_extensions, VkSurfaceBuild};
 use winit::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
@@ -26,7 +26,7 @@ fn main() {
 
     // Create a Vulkan instance
     let app_info = app_info_from_cargo_toml!();
-    let extensions = InstanceExtensions::supported_by_core().unwrap();
+    let extensions = required_extensions();
     let instance = if cfg!(debug_assertions) {
         let extensions = InstanceExtensions {
             ext_debug_utils: true,
@@ -88,7 +88,9 @@ fn main() {
     }
 
     let event_loop = EventLoop::new();
-    let _window = WindowBuilder::new().build(&event_loop).unwrap();
+    let _surface = WindowBuilder::new()
+        .build_vk_surface(&event_loop, instance.clone())
+        .unwrap();
 
     println!("=== Devices ===");
     PhysicalDevice::enumerate(&instance).for_each(|device| {
