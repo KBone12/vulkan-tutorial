@@ -1,10 +1,14 @@
 use vulkano::{
     app_info_from_cargo_toml,
     device::{Device, DeviceExtensions, Features},
+    format::Format,
+    image::ImageUsage,
     instance::{
         debug::{DebugCallback, MessageSeverity, MessageType},
         layers_list, Instance, InstanceExtensions, PhysicalDevice,
     },
+    swapchain::{ColorSpace, CompositeAlpha, FullscreenExclusive, PresentMode, Swapchain},
+    sync::SharingMode,
 };
 use vulkano_win::{required_extensions, VkSurfaceBuild};
 use winit::{
@@ -103,7 +107,7 @@ fn main() {
         println!("Type: {:?}", device.ty());
     });
 
-    let (_device, mut queues) = PhysicalDevice::enumerate(&instance)
+    let (device, mut queues) = PhysicalDevice::enumerate(&instance)
         .filter_map(|device| {
             let graphics_queue_family = device
                 .queue_families()
@@ -124,10 +128,14 @@ fn main() {
                 })
         })
         .filter_map(|(device, queue_families)| {
+            let extensions = DeviceExtensions {
+                khr_swapchain: true,
+                ..DeviceExtensions::supported_by_device(device)
+            };
             Device::new(
                 device,
                 &Features::none(),
-                &DeviceExtensions::supported_by_device(device),
+                &extensions,
                 queue_families
                     .iter()
                     .map(|queue_family| (*queue_family, 1.0)),
@@ -136,12 +144,71 @@ fn main() {
         })
         .next()
         .expect("Could not find any GPU");
-    let _graphics_queue = queues
+    let graphics_queue = queues
         .find(|queue| queue.family().supports_graphics())
         .unwrap();
-    let _present_queue = queues
+    let present_queue = queues
         .find(|queue| surface.is_supported(queue.family()) == Ok(true))
         .unwrap();
+
+    let (_swapchain, _spwapchain_image) = {
+        let capabilities = surface.capabilities(device.physical_device()).unwrap();
+        let num_images = 2; // Request double buffering
+        let (format, color_space) = capabilities
+            .supported_formats
+            .iter()
+            .find(|(format, color_space)| {
+                *format == Format::B8G8R8A8Unorm && *color_space == ColorSpace::SrgbNonLinear
+            })
+            .expect("Not supported");
+        let dimensions = if let Some(dimensions) = capabilities.current_extent {
+            dimensions
+        } else {
+            let [w, h]: [u32; 2] = surface.window().inner_size().into();
+            let [min_w, min_h] = capabilities.min_image_extent;
+            let [max_w, max_h] = capabilities.max_image_extent;
+            // clamp width and height
+            [min_w.max(max_w.min(w)), min_h.max(max_h.min(h))]
+        };
+        let layers = 1; // Usually 1
+        let image_usage = ImageUsage {
+            color_attachment: true,
+            ..ImageUsage::none()
+        };
+        let sharing = if graphics_queue.family() == present_queue.family() {
+            SharingMode::from(&graphics_queue)
+        } else {
+            SharingMode::from(vec![&graphics_queue, &present_queue].as_slice())
+        };
+        let alpha = capabilities
+            .supported_composite_alpha
+            .iter()
+            .find(|alpha| *alpha == CompositeAlpha::Opaque)
+            .expect("Not supported");
+        let present_mode = capabilities
+            .present_modes
+            .iter()
+            .find(|mode| *mode == PresentMode::Fifo)
+            .expect("Not supported");
+        let clipped = true;
+        Swapchain::new(
+            device,
+            surface,
+            num_images,
+            *format,
+            dimensions,
+            layers,
+            image_usage,
+            sharing,
+            capabilities.current_transform,
+            alpha,
+            present_mode,
+            FullscreenExclusive::Default,
+            clipped,
+            *color_space,
+        )
+        .unwrap()
+    };
 
     event_loop.run(|event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
