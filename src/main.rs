@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use vulkano::{
     app_info_from_cargo_toml,
     device::{Device, DeviceExtensions, Features},
     format::Format,
-    framebuffer::Subpass,
+    framebuffer::{Framebuffer, Subpass},
     image::ImageUsage,
     instance::{
         debug::{DebugCallback, MessageSeverity, MessageType},
@@ -154,7 +156,7 @@ fn main() {
         .find(|queue| surface.is_supported(queue.family()) == Ok(true))
         .unwrap();
 
-    let (swapchain, _spwapchain_image) = {
+    let (swapchain, spwapchain_image) = {
         let capabilities = surface.capabilities(device.physical_device()).unwrap();
         let num_images = capabilities.min_image_count + 1;
         let (format, color_space) = capabilities
@@ -238,21 +240,23 @@ fn main() {
         ],
         depth_range: 0.0..1.0,
     };
-    let render_pass = single_pass_renderpass!(device.clone(),
-        attachments: {
-            color: {
-                load: Clear,
-                store: Store,
-                format: swapchain.format(),
-                samples: 1,
+    let render_pass = Arc::new(
+        single_pass_renderpass!(device.clone(),
+            attachments: {
+                color: {
+                    load: Clear,
+                    store: Store,
+                    format: swapchain.format(),
+                    samples: 1,
+                }
+            },
+            pass: {
+                color: [color],
+                depth_stencil: {}
             }
-        },
-        pass: {
-            color: [color],
-            depth_stencil: {}
-        }
-    )
-    .unwrap();
+        )
+        .unwrap(),
+    );
     let _graphics_pipeline = GraphicsPipeline::start()
         .vertex_input(BufferlessDefinition)
         .vertex_shader(vertex_shader.main_entry_point(), ())
@@ -265,9 +269,22 @@ fn main() {
         .cull_mode_back()
         .front_face_clockwise()
         .blend_pass_through()
-        .render_pass(Subpass::from(render_pass, 0).unwrap())
+        .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
         .build(device.clone())
         .expect("Could not create a graphics pipeline");
+
+    let _framebuffers: Vec<_> = spwapchain_image
+        .iter()
+        .map(|image| {
+            Arc::new(
+                Framebuffer::start(render_pass.clone())
+                    .add(image)
+                    .unwrap()
+                    .build()
+                    .expect("Could not create a framebuffer"),
+            )
+        })
+        .collect();
 
     event_loop.run(|event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
