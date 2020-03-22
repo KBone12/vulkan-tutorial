@@ -156,7 +156,7 @@ fn main() {
 
     let (swapchain, _spwapchain_image) = {
         let capabilities = surface.capabilities(device.physical_device()).unwrap();
-        let num_images = 2; // Request double buffering
+        let num_images = capabilities.min_image_count + 1;
         let (format, color_space) = capabilities
             .supported_formats
             .iter()
