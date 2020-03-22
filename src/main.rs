@@ -2,11 +2,14 @@ use vulkano::{
     app_info_from_cargo_toml,
     device::{Device, DeviceExtensions, Features},
     format::Format,
+    framebuffer::Subpass,
     image::ImageUsage,
     instance::{
         debug::{DebugCallback, MessageSeverity, MessageType},
         layers_list, Instance, InstanceExtensions, PhysicalDevice,
     },
+    pipeline::{vertex::BufferlessDefinition, viewport::Viewport, GraphicsPipeline},
+    single_pass_renderpass,
     swapchain::{ColorSpace, CompositeAlpha, FullscreenExclusive, PresentMode, Swapchain},
     sync::SharingMode,
 };
@@ -151,7 +154,7 @@ fn main() {
         .find(|queue| surface.is_supported(queue.family()) == Ok(true))
         .unwrap();
 
-    let (_swapchain, _spwapchain_image) = {
+    let (swapchain, _spwapchain_image) = {
         let capabilities = surface.capabilities(device.physical_device()).unwrap();
         let num_images = 2; // Request double buffering
         let (format, color_space) = capabilities
@@ -192,7 +195,7 @@ fn main() {
             .expect("Not supported");
         let clipped = true;
         Swapchain::new(
-            device,
+            device.clone(),
             surface,
             num_images,
             *format,
@@ -209,6 +212,62 @@ fn main() {
         )
         .unwrap()
     };
+
+    // Create a graphics pipeline
+    mod vertex_shader {
+        vulkano_shaders::shader! {
+            ty: "vertex",
+            path: "src/shader/triangle.vert"
+        }
+    }
+    mod fragment_shader {
+        vulkano_shaders::shader! {
+            ty: "fragment",
+            path: "src/shader/triangle.frag"
+        }
+    }
+    let vertex_shader =
+        vertex_shader::Shader::load(device.clone()).expect("Failed to load the vertex shader");
+    let fragment_shader =
+        fragment_shader::Shader::load(device.clone()).expect("Failed to load the fragment shader");
+    let viewport = Viewport {
+        origin: [0.0, 0.0],
+        dimensions: [
+            swapchain.dimensions()[0] as _,
+            swapchain.dimensions()[1] as _,
+        ],
+        depth_range: 0.0..1.0,
+    };
+    let render_pass = single_pass_renderpass!(device.clone(),
+        attachments: {
+            color: {
+                load: Clear,
+                store: Store,
+                format: swapchain.format(),
+                samples: 1,
+            }
+        },
+        pass: {
+            color: [color],
+            depth_stencil: {}
+        }
+    )
+    .unwrap();
+    let _graphics_pipeline = GraphicsPipeline::start()
+        .vertex_input(BufferlessDefinition)
+        .vertex_shader(vertex_shader.main_entry_point(), ())
+        .fragment_shader(fragment_shader.main_entry_point(), ())
+        .triangle_list()
+        .viewports(vec![viewport])
+        .depth_clamp(false)
+        .polygon_mode_fill()
+        .line_width(1.0)
+        .cull_mode_back()
+        .front_face_clockwise()
+        .blend_pass_through()
+        .render_pass(Subpass::from(render_pass, 0).unwrap())
+        .build(device.clone())
+        .expect("Could not create a graphics pipeline");
 
     event_loop.run(|event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
