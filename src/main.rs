@@ -1,7 +1,8 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use vulkano::{
     app_info_from_cargo_toml,
+    command_buffer::{AutoCommandBufferBuilder, DynamicState},
     device::{Device, DeviceExtensions, Features},
     format::Format,
     framebuffer::{Framebuffer, Subpass},
@@ -10,10 +11,16 @@ use vulkano::{
         debug::{DebugCallback, MessageSeverity, MessageType},
         layers_list, Instance, InstanceExtensions, PhysicalDevice,
     },
-    pipeline::{vertex::BufferlessDefinition, viewport::Viewport, GraphicsPipeline},
+    pipeline::{
+        vertex::{BufferlessDefinition, BufferlessVertices},
+        viewport::Viewport,
+        GraphicsPipeline,
+    },
     single_pass_renderpass,
-    swapchain::{ColorSpace, CompositeAlpha, FullscreenExclusive, PresentMode, Swapchain},
-    sync::SharingMode,
+    swapchain::{
+        acquire_next_image, ColorSpace, CompositeAlpha, FullscreenExclusive, PresentMode, Swapchain,
+    },
+    sync::{GpuFuture, SharingMode},
 };
 use vulkano_win::{required_extensions, VkSurfaceBuild};
 use winit::{
@@ -120,17 +127,13 @@ fn main() {
             let present_queue_family = device
                 .queue_families()
                 .find(|queue_family| surface.is_supported(*queue_family) == Ok(true));
-            graphics_queue_family
-                .and(present_queue_family)
-                .and_then(|_| {
-                    Some((
-                        device,
-                        vec![
-                            graphics_queue_family.unwrap(),
-                            present_queue_family.unwrap(),
-                        ],
-                    ))
-                })
+            let mut queue_families_set = HashSet::new();
+            let unique_queue_families: Vec<_> = vec![graphics_queue_family, present_queue_family]
+                .iter()
+                .filter_map(|queue_family| *queue_family)
+                .filter(|queue_family| queue_families_set.insert(queue_family.id()))
+                .collect();
+            Some((device, unique_queue_families))
         })
         .filter_map(|(device, queue_families)| {
             let extensions = DeviceExtensions {
@@ -154,7 +157,7 @@ fn main() {
         .unwrap();
     let present_queue = queues
         .find(|queue| surface.is_supported(queue.family()) == Ok(true))
-        .unwrap();
+        .unwrap_or_else(|| graphics_queue.clone());
 
     let (swapchain, spwapchain_image) = {
         let capabilities = surface.capabilities(device.physical_device()).unwrap();
@@ -198,7 +201,7 @@ fn main() {
         let clipped = true;
         Swapchain::new(
             device.clone(),
-            surface,
+            surface.clone(),
             num_images,
             *format,
             dimensions,
@@ -257,28 +260,30 @@ fn main() {
         )
         .unwrap(),
     );
-    let _graphics_pipeline = GraphicsPipeline::start()
-        .vertex_input(BufferlessDefinition)
-        .vertex_shader(vertex_shader.main_entry_point(), ())
-        .fragment_shader(fragment_shader.main_entry_point(), ())
-        .triangle_list()
-        .viewports(vec![viewport])
-        .depth_clamp(false)
-        .polygon_mode_fill()
-        .line_width(1.0)
-        .cull_mode_back()
-        .front_face_clockwise()
-        .blend_pass_through()
-        .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
-        .build(device.clone())
-        .expect("Could not create a graphics pipeline");
+    let graphics_pipeline = Arc::new(
+        GraphicsPipeline::start()
+            .vertex_input(BufferlessDefinition)
+            .vertex_shader(vertex_shader.main_entry_point(), ())
+            .fragment_shader(fragment_shader.main_entry_point(), ())
+            .triangle_list()
+            .viewports(vec![viewport])
+            .depth_clamp(false)
+            .polygon_mode_fill()
+            .line_width(1.0)
+            .cull_mode_back()
+            .front_face_clockwise()
+            .blend_pass_through()
+            .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
+            .build(device.clone())
+            .expect("Could not create a graphics pipeline"),
+    );
 
-    let _framebuffers: Vec<_> = spwapchain_image
+    let framebuffers: Vec<_> = spwapchain_image
         .iter()
         .map(|image| {
             Arc::new(
                 Framebuffer::start(render_pass.clone())
-                    .add(image)
+                    .add(image.clone())
                     .unwrap()
                     .build()
                     .expect("Could not create a framebuffer"),
@@ -286,7 +291,42 @@ fn main() {
         })
         .collect();
 
-    event_loop.run(|event, _, control_flow| {
+    let command_buffers: Vec<_> = framebuffers
+        .iter()
+        .map(|framebuffer| {
+            let vertices = BufferlessVertices {
+                vertices: 3, // triangle
+                instances: 1,
+            };
+            Arc::new(
+                AutoCommandBufferBuilder::primary_simultaneous_use(
+                    device.clone(),
+                    graphics_queue.family(),
+                )
+                .unwrap()
+                .begin_render_pass(
+                    framebuffer.clone(),
+                    false,
+                    vec![[0.0, 0.0, 0.0, 1.0].into()],
+                )
+                .unwrap()
+                .draw(
+                    graphics_pipeline.clone(),
+                    &DynamicState::none(),
+                    vertices,
+                    (),
+                    (),
+                )
+                .unwrap()
+                .end_render_pass()
+                .unwrap()
+                .build()
+                .unwrap(),
+            )
+        })
+        .collect();
+
+    event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
             Event::WindowEvent {
@@ -294,6 +334,28 @@ fn main() {
                 ..
             } => {
                 *control_flow = ControlFlow::Exit;
+            }
+            Event::MainEventsCleared => {
+                surface.window().request_redraw();
+            }
+            Event::RedrawRequested(_) => {
+                if let Ok((image_index, _, acquire_future)) =
+                    acquire_next_image(swapchain.clone(), None)
+                {
+                    let command_buffer = command_buffers[image_index].clone();
+                    if let Ok(future) =
+                        acquire_future.then_execute(graphics_queue.clone(), command_buffer)
+                    {
+                        let _ = future
+                            .then_swapchain_present(
+                                present_queue.clone(),
+                                swapchain.clone(),
+                                image_index,
+                            )
+                            .then_signal_fence_and_flush()
+                            .and_then(|future| future.wait(None));
+                    }
+                }
             }
             _ => {}
         };
