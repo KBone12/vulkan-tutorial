@@ -1,15 +1,19 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, error::Error, sync::Arc};
 
 use vulkano::{
     app_info_from_cargo_toml,
-    command_buffer::{AutoCommandBufferBuilder, DynamicState},
-    device::{Device, DeviceExtensions, Features},
+    command_buffer::{AutoCommandBuffer, AutoCommandBufferBuilder, DynamicState},
+    descriptor::PipelineLayoutAbstract,
+    device::{Device, DeviceCreationError, DeviceExtensions, Features, Queue},
     format::Format,
-    framebuffer::{Framebuffer, Subpass},
-    image::ImageUsage,
+    framebuffer::{
+        Framebuffer, FramebufferAbstract, FramebufferCreationError, RenderPassAbstract,
+        RenderPassCreationError, Subpass,
+    },
+    image::{swapchain::SwapchainImage, ImageUsage},
     instance::{
-        debug::{DebugCallback, MessageSeverity, MessageType},
-        layers_list, Instance, InstanceExtensions, PhysicalDevice,
+        debug::{DebugCallback, DebugCallbackCreationError, MessageSeverity, MessageType},
+        layers_list, Instance, InstanceCreationError, InstanceExtensions, PhysicalDevice,
     },
     pipeline::{
         vertex::{BufferlessDefinition, BufferlessVertices},
@@ -18,7 +22,8 @@ use vulkano::{
     },
     single_pass_renderpass,
     swapchain::{
-        acquire_next_image, ColorSpace, CompositeAlpha, FullscreenExclusive, PresentMode, Swapchain,
+        acquire_next_image, CapabilitiesError, ColorSpace, CompositeAlpha, FullscreenExclusive,
+        PresentMode, Surface, Swapchain, SwapchainCreationError,
     },
     sync::{GpuFuture, SharingMode},
 };
@@ -26,10 +31,10 @@ use vulkano_win::{required_extensions, VkSurfaceBuild};
 use winit::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
-    window::WindowBuilder,
+    window::{Window, WindowBuilder},
 };
 
-fn main() {
+fn print_layers_list() {
     println!("=== Layers ===");
     layers_list().unwrap().for_each(|layer| {
         println!(
@@ -39,8 +44,22 @@ fn main() {
         );
         println!("Description: {}", layer.description());
     });
+}
 
-    // Create a Vulkan instance
+fn print_physical_devices(instance: &Arc<Instance>) {
+    println!("=== Devices ===");
+    PhysicalDevice::enumerate(instance).for_each(|device| {
+        println!("{} (index: {})", device.name(), device.index());
+        println!(
+            "API version: {}, Driver version: {}",
+            device.api_version(),
+            device.driver_version()
+        );
+        println!("Type: {:?}", device.ty());
+    });
+}
+
+fn create_vulkan_instance() -> Result<Arc<Instance>, InstanceCreationError> {
     let app_info = app_info_from_cargo_toml!();
     let extensions = required_extensions();
     let instance = if cfg!(debug_assertions) {
@@ -67,59 +86,52 @@ fn main() {
     } else {
         Instance::new(Some(&app_info), &extensions, None)
     };
-    let instance = instance.expect("Could not build a Vulkan instance");
+    instance
+}
 
-    // Register a debugging callback
-    if cfg!(debug_assertions) {
-        let severity = MessageSeverity {
-            error: true,
-            warning: true,
-            information: true,
-            verbose: true,
-        };
-        let ty = MessageType::all();
-        DebugCallback::new(&instance, severity, ty, |message| {
-            let severity = if message.severity.error {
-                "ERROR"
-            } else if message.severity.warning {
-                "Warning"
-            } else if message.severity.information {
-                "Info"
-            } else {
-                "Verbose"
-            };
-            let ty = if message.ty.general {
-                "general"
-            } else if message.ty.validation {
-                "validation"
-            } else {
-                "performance"
-            };
-            eprintln!(
-                "{} (type: {}) (layer: {}): {}",
-                severity, ty, message.layer_prefix, message.description
-            );
-        })
-        .ok();
+fn register_debug_callback(
+    instance: &Arc<Instance>,
+) -> Option<Result<DebugCallback, DebugCallbackCreationError>> {
+    if !cfg!(debug_assertions) {
+        return None;
     }
 
-    let event_loop = EventLoop::new();
-    let surface = WindowBuilder::new()
-        .build_vk_surface(&event_loop, instance.clone())
-        .unwrap();
-
-    println!("=== Devices ===");
-    PhysicalDevice::enumerate(&instance).for_each(|device| {
-        println!("{} (index: {})", device.name(), device.index());
-        println!(
-            "API version: {}, Driver version: {}",
-            device.api_version(),
-            device.driver_version()
+    let severity = MessageSeverity {
+        error: true,
+        warning: true,
+        information: true,
+        verbose: true,
+    };
+    let ty = MessageType::all();
+    Some(DebugCallback::new(instance, severity, ty, |message| {
+        let severity = if message.severity.error {
+            "ERROR"
+        } else if message.severity.warning {
+            "Warning"
+        } else if message.severity.information {
+            "Info"
+        } else {
+            "Verbose"
+        };
+        let ty = if message.ty.general {
+            "general"
+        } else if message.ty.validation {
+            "validation"
+        } else {
+            "performance"
+        };
+        eprintln!(
+            "{} (type: {}) (layer: {}): {}",
+            severity, ty, message.layer_prefix, message.description
         );
-        println!("Type: {:?}", device.ty());
-    });
+    }))
+}
 
-    let (device, mut queues) = PhysicalDevice::enumerate(&instance)
+fn create_device_and_queues(
+    instance: &Arc<Instance>,
+    surface: &Arc<Surface<Window>>,
+) -> Result<(Arc<Device>, Arc<Queue>, Arc<Queue>), DeviceCreationError> {
+    let (device, queues) = PhysicalDevice::enumerate(instance)
         .filter_map(|device| {
             let graphics_queue_family = device
                 .queue_families()
@@ -127,15 +139,24 @@ fn main() {
             let present_queue_family = device
                 .queue_families()
                 .find(|queue_family| surface.is_supported(*queue_family) == Ok(true));
-            let mut queue_families_set = HashSet::new();
-            let unique_queue_families: Vec<_> = vec![graphics_queue_family, present_queue_family]
-                .iter()
-                .filter_map(|queue_family| *queue_family)
-                .filter(|queue_family| queue_families_set.insert(queue_family.id()))
-                .collect();
-            Some((device, unique_queue_families))
+            graphics_queue_family
+                .and(present_queue_family)
+                .and_then(|_| {
+                    // safe to unwrap
+                    let graphics_queue_family = graphics_queue_family.unwrap();
+                    let present_queue_family = present_queue_family.unwrap();
+
+                    let mut queue_families_set = HashSet::new();
+                    let unique_queue_families: Vec<_> =
+                        vec![graphics_queue_family, present_queue_family]
+                            .iter()
+                            .filter(|queue_family| queue_families_set.insert(queue_family.id()))
+                            .map(|queue_family| queue_family.to_owned())
+                            .collect();
+                    Some((device, unique_queue_families))
+                })
         })
-        .filter_map(|(device, queue_families)| {
+        .map(|(device, queue_families)| {
             let extensions = DeviceExtensions {
                 khr_swapchain: true,
                 ..DeviceExtensions::supported_by_device(device)
@@ -148,77 +169,124 @@ fn main() {
                     .iter()
                     .map(|queue_family| (*queue_family, 1.0)),
             )
-            .ok()
         })
+        .filter(|device| device.is_ok())
         .next()
-        .expect("Could not find any GPU");
+        .ok_or(DeviceCreationError::FeatureNotPresent)??; // If nothing found, return DeviceCreationError::FeatureNotPresent
+    let queues: Vec<Arc<Queue>> = queues.collect();
     let graphics_queue = queues
+        .iter()
         .find(|queue| queue.family().supports_graphics())
-        .unwrap();
+        .unwrap(); // Must safe
     let present_queue = queues
+        .iter()
         .find(|queue| surface.is_supported(queue.family()) == Ok(true))
-        .unwrap_or_else(|| graphics_queue.clone());
+        .unwrap(); // Must safe
+    Ok((device, graphics_queue.clone(), present_queue.clone()))
+}
 
-    let (swapchain, spwapchain_image) = {
-        let capabilities = surface.capabilities(device.physical_device()).unwrap();
-        let num_images = capabilities.min_image_count + 1;
-        let (format, color_space) = capabilities
-            .supported_formats
-            .iter()
-            .find(|(format, color_space)| {
-                *format == Format::B8G8R8A8Unorm && *color_space == ColorSpace::SrgbNonLinear
-            })
-            .expect("Not supported");
-        let dimensions = if let Some(dimensions) = capabilities.current_extent {
-            dimensions
-        } else {
-            let [w, h]: [u32; 2] = surface.window().inner_size().into();
-            let [min_w, min_h] = capabilities.min_image_extent;
-            let [max_w, max_h] = capabilities.max_image_extent;
-            // clamp width and height
-            [min_w.max(max_w.min(w)), min_h.max(max_h.min(h))]
-        };
-        let layers = 1; // Usually 1
-        let image_usage = ImageUsage {
-            color_attachment: true,
-            ..ImageUsage::none()
-        };
-        let sharing = if graphics_queue.family() == present_queue.family() {
-            SharingMode::from(&graphics_queue)
-        } else {
-            SharingMode::from(vec![&graphics_queue, &present_queue].as_slice())
-        };
-        let alpha = capabilities
-            .supported_composite_alpha
-            .iter()
-            .find(|alpha| *alpha == CompositeAlpha::Opaque)
-            .expect("Not supported");
-        let present_mode = capabilities
-            .present_modes
-            .iter()
-            .find(|mode| *mode == PresentMode::Fifo)
-            .expect("Not supported");
-        let clipped = true;
-        Swapchain::new(
-            device.clone(),
-            surface.clone(),
-            num_images,
-            *format,
-            dimensions,
-            layers,
-            image_usage,
-            sharing,
-            capabilities.current_transform,
-            alpha,
-            present_mode,
-            FullscreenExclusive::Default,
-            clipped,
-            *color_space,
-        )
-        .unwrap()
+fn create_swapchain(
+    surface: &Arc<Surface<Window>>,
+    device: &Arc<Device>,
+    graphics_queue: &Arc<Queue>,
+    present_queue: &Arc<Queue>,
+) -> Result<(Arc<Swapchain<Window>>, Vec<Arc<SwapchainImage<Window>>>), SwapchainCreationError> {
+    let capabilities = surface
+        .capabilities(device.physical_device())
+        .map_err(|e| match e {
+            CapabilitiesError::OomError(e) => SwapchainCreationError::OomError(e),
+            CapabilitiesError::SurfaceLost => SwapchainCreationError::SurfaceLost,
+        })?;
+    let num_images = capabilities.min_image_count + 1;
+    let (format, color_space) = capabilities
+        .supported_formats
+        .iter()
+        .find(|(format, color_space)| {
+            *format == Format::B8G8R8A8Unorm && *color_space == ColorSpace::SrgbNonLinear
+        })
+        .ok_or(SwapchainCreationError::UnsupportedFormat)?;
+    let dimensions = if let Some(dimensions) = capabilities.current_extent {
+        dimensions
+    } else {
+        let [w, h]: [u32; 2] = surface.window().inner_size().into();
+        let [min_w, min_h] = capabilities.min_image_extent;
+        let [max_w, max_h] = capabilities.max_image_extent;
+        // clamp width and height
+        [min_w.max(max_w.min(w)), min_h.max(max_h.min(h))]
     };
+    let layers = 1; // Usually 1
+    let image_usage = ImageUsage {
+        color_attachment: true,
+        ..ImageUsage::none()
+    };
+    let sharing = if graphics_queue.family() == present_queue.family() {
+        SharingMode::from(graphics_queue)
+    } else {
+        SharingMode::from(vec![graphics_queue, present_queue].as_slice())
+    };
+    let alpha = capabilities
+        .supported_composite_alpha
+        .iter()
+        .find(|alpha| *alpha == CompositeAlpha::Opaque)
+        .ok_or(SwapchainCreationError::UnsupportedCompositeAlpha)?;
+    let present_mode = capabilities
+        .present_modes
+        .iter()
+        .find(|mode| *mode == PresentMode::Fifo)
+        .ok_or(SwapchainCreationError::UnsupportedPresentMode)?;
+    let clipped = true;
+    Swapchain::new(
+        device.clone(),
+        surface.clone(),
+        num_images,
+        *format,
+        dimensions,
+        layers,
+        image_usage,
+        sharing,
+        capabilities.current_transform,
+        alpha,
+        present_mode,
+        FullscreenExclusive::Default,
+        clipped,
+        *color_space,
+    )
+}
 
-    // Create a graphics pipeline
+fn create_render_pass(
+    device: &Arc<Device>,
+    color_format: Format,
+) -> Result<Arc<dyn RenderPassAbstract + Send + Sync>, RenderPassCreationError> {
+    Ok(Arc::new(single_pass_renderpass!(device.clone(),
+        attachments: {
+            color: {
+                load: Clear,
+                store: Store,
+                format: color_format,
+                samples: 1,
+            }
+        },
+        pass: {
+            color: [color],
+            depth_stencil: {}
+        }
+    )?))
+}
+
+fn create_graphics_pipeline(
+    device: &Arc<Device>,
+    dimensions: [f32; 2],
+    render_pass: &Arc<dyn RenderPassAbstract + Send + Sync>,
+) -> Result<
+    Arc<
+        GraphicsPipeline<
+            BufferlessDefinition,
+            Box<dyn PipelineLayoutAbstract + Send + Sync>,
+            Arc<dyn RenderPassAbstract + Send + Sync>,
+        >,
+    >,
+    Box<dyn Error>,
+> {
     mod vertex_shader {
         vulkano_shaders::shader! {
             ty: "vertex",
@@ -231,36 +299,14 @@ fn main() {
             path: "src/shader/triangle.frag"
         }
     }
-    let vertex_shader =
-        vertex_shader::Shader::load(device.clone()).expect("Failed to load the vertex shader");
-    let fragment_shader =
-        fragment_shader::Shader::load(device.clone()).expect("Failed to load the fragment shader");
+    let vertex_shader = vertex_shader::Shader::load(device.clone())?;
+    let fragment_shader = fragment_shader::Shader::load(device.clone())?;
     let viewport = Viewport {
         origin: [0.0, 0.0],
-        dimensions: [
-            swapchain.dimensions()[0] as _,
-            swapchain.dimensions()[1] as _,
-        ],
+        dimensions,
         depth_range: 0.0..1.0,
     };
-    let render_pass = Arc::new(
-        single_pass_renderpass!(device.clone(),
-            attachments: {
-                color: {
-                    load: Clear,
-                    store: Store,
-                    format: swapchain.format(),
-                    samples: 1,
-                }
-            },
-            pass: {
-                color: [color],
-                depth_stencil: {}
-            }
-        )
-        .unwrap(),
-    );
-    let graphics_pipeline = Arc::new(
+    Ok(Arc::new(
         GraphicsPipeline::start()
             .vertex_input(BufferlessDefinition)
             .vertex_shader(vertex_shader.main_entry_point(), ())
@@ -274,57 +320,105 @@ fn main() {
             .front_face_clockwise()
             .blend_pass_through()
             .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
-            .build(device.clone())
-            .expect("Could not create a graphics pipeline"),
-    );
+            .build(device.clone())?,
+    ))
+}
 
-    let framebuffers: Vec<_> = spwapchain_image
+fn create_framebuffers(
+    swapchain_images: &[Arc<SwapchainImage<Window>>],
+    render_pass: &Arc<dyn RenderPassAbstract + Send + Sync>,
+) -> Result<Vec<Arc<dyn FramebufferAbstract + Send + Sync>>, FramebufferCreationError> {
+    swapchain_images
         .iter()
         .map(|image| {
-            Arc::new(
-                Framebuffer::start(render_pass.clone())
-                    .add(image.clone())
-                    .unwrap()
-                    .build()
-                    .expect("Could not create a framebuffer"),
-            )
+            Framebuffer::start(render_pass.clone())
+                .add(image.clone())
+                .unwrap()
+                .build()
+                .map(|framebuffer| {
+                    let framebuffer: Arc<dyn FramebufferAbstract + Send + Sync> =
+                        Arc::new(framebuffer);
+                    framebuffer
+                })
         })
-        .collect();
+        .collect()
+}
 
-    let command_buffers: Vec<_> = framebuffers
+fn create_command_buffer(
+    framebuffers: &[Arc<dyn FramebufferAbstract + Send + Sync>],
+    device: &Arc<Device>,
+    graphics_queue: &Arc<Queue>,
+    graphics_pipeline: &Arc<
+        GraphicsPipeline<
+            BufferlessDefinition,
+            Box<dyn PipelineLayoutAbstract + Send + Sync>,
+            Arc<dyn RenderPassAbstract + Send + Sync>,
+        >,
+    >,
+) -> Result<Vec<Arc<AutoCommandBuffer>>, Box<dyn Error>> {
+    framebuffers
         .iter()
         .map(|framebuffer| {
             let vertices = BufferlessVertices {
                 vertices: 3, // triangle
                 instances: 1,
             };
-            Arc::new(
-                AutoCommandBufferBuilder::primary_simultaneous_use(
-                    device.clone(),
-                    graphics_queue.family(),
-                )
-                .unwrap()
-                .begin_render_pass(
-                    framebuffer.clone(),
-                    false,
-                    vec![[0.0, 0.0, 0.0, 1.0].into()],
-                )
-                .unwrap()
-                .draw(
-                    graphics_pipeline.clone(),
-                    &DynamicState::none(),
-                    vertices,
-                    (),
-                    (),
-                )
-                .unwrap()
-                .end_render_pass()
-                .unwrap()
-                .build()
-                .unwrap(),
-            )
+            let command_buffer = AutoCommandBufferBuilder::primary_simultaneous_use(
+                device.clone(),
+                graphics_queue.family(),
+            )?
+            .begin_render_pass(
+                framebuffer.clone(),
+                false,
+                vec![[0.0, 0.0, 0.0, 1.0].into()],
+            )?
+            .draw(
+                graphics_pipeline.clone(),
+                &DynamicState::none(),
+                vertices,
+                (),
+                (),
+            )?
+            .end_render_pass()?
+            .build()?;
+            Ok(Arc::new(command_buffer))
         })
-        .collect();
+        .collect()
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    print_layers_list();
+
+    let instance = create_vulkan_instance()?;
+    let _ = match register_debug_callback(&instance) {
+        Some(result) => Some(result?),
+        None => None, // None for release mode
+    };
+
+    print_physical_devices(&instance);
+
+    let event_loop = EventLoop::new();
+    let surface = WindowBuilder::new()
+        .build_vk_surface(&event_loop, instance.clone())
+        .unwrap();
+
+    let (device, graphics_queue, present_queue) = create_device_and_queues(&instance, &surface)?;
+    let (swapchain, swapchain_images) =
+        create_swapchain(&surface, &device, &graphics_queue, &present_queue)?;
+
+    let render_pass = create_render_pass(&device, swapchain.format())?;
+    let graphics_pipeline = create_graphics_pipeline(
+        &device,
+        [
+            swapchain.dimensions()[0] as _,
+            swapchain.dimensions()[1] as _,
+        ],
+        &render_pass,
+    )?;
+
+    let framebuffers: Vec<_> = create_framebuffers(&swapchain_images, &render_pass)?;
+    let command_buffers: Vec<_> =
+        create_command_buffer(&framebuffers, &device, &graphics_queue, &graphics_pipeline)?;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
