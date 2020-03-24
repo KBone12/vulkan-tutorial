@@ -22,10 +22,10 @@ use vulkano::{
     },
     single_pass_renderpass,
     swapchain::{
-        acquire_next_image, CapabilitiesError, ColorSpace, CompositeAlpha, FullscreenExclusive,
-        PresentMode, Surface, Swapchain, SwapchainCreationError,
+        acquire_next_image, AcquireError, CapabilitiesError, ColorSpace, CompositeAlpha,
+        FullscreenExclusive, PresentMode, Surface, Swapchain, SwapchainCreationError,
     },
-    sync::{GpuFuture, SharingMode},
+    sync::{self, FlushError, GpuFuture, SharingMode},
 };
 use vulkano_win::{required_extensions, VkSurfaceBuild};
 use winit::{
@@ -197,14 +197,10 @@ fn create_swapchain(
             CapabilitiesError::OomError(e) => SwapchainCreationError::OomError(e),
             CapabilitiesError::SurfaceLost => SwapchainCreationError::SurfaceLost,
         })?;
-    let num_images = capabilities.min_image_count + 1;
-    let (format, color_space) = capabilities
-        .supported_formats
-        .iter()
-        .find(|(format, color_space)| {
-            *format == Format::B8G8R8A8Unorm && *color_space == ColorSpace::SrgbNonLinear
-        })
-        .ok_or(SwapchainCreationError::UnsupportedFormat)?;
+    let num_images = capabilities
+        .max_image_count
+        .unwrap_or(capabilities.min_image_count + 1)
+        .min(capabilities.min_image_count + 1);
     let dimensions = if let Some(dimensions) = capabilities.current_extent {
         dimensions
     } else {
@@ -224,32 +220,22 @@ fn create_swapchain(
     } else {
         SharingMode::from(vec![graphics_queue, present_queue].as_slice())
     };
-    let alpha = capabilities
-        .supported_composite_alpha
-        .iter()
-        .find(|alpha| *alpha == CompositeAlpha::Opaque)
-        .ok_or(SwapchainCreationError::UnsupportedCompositeAlpha)?;
-    let present_mode = capabilities
-        .present_modes
-        .iter()
-        .find(|mode| *mode == PresentMode::Fifo)
-        .ok_or(SwapchainCreationError::UnsupportedPresentMode)?;
     let clipped = true;
     Swapchain::new(
         device.clone(),
         surface.clone(),
         num_images,
-        *format,
+        Format::B8G8R8A8Unorm,
         dimensions,
         layers,
         image_usage,
         sharing,
         capabilities.current_transform,
-        alpha,
-        present_mode,
+        CompositeAlpha::Opaque,
+        PresentMode::Fifo,
         FullscreenExclusive::Default,
         clipped,
-        *color_space,
+        ColorSpace::SrgbNonLinear,
     )
 }
 
@@ -344,7 +330,7 @@ fn create_framebuffers(
         .collect()
 }
 
-fn create_command_buffer(
+fn create_command_buffers(
     framebuffers: &[Arc<dyn FramebufferAbstract + Send + Sync>],
     device: &Arc<Device>,
     graphics_queue: &Arc<Queue>,
@@ -403,11 +389,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap();
 
     let (device, graphics_queue, present_queue) = create_device_and_queues(&instance, &surface)?;
-    let (swapchain, swapchain_images) =
+    let (mut swapchain, mut swapchain_images) =
         create_swapchain(&surface, &device, &graphics_queue, &present_queue)?;
 
-    let render_pass = create_render_pass(&device, swapchain.format())?;
-    let graphics_pipeline = create_graphics_pipeline(
+    let mut render_pass = create_render_pass(&device, swapchain.format())?;
+    let mut graphics_pipeline = create_graphics_pipeline(
         &device,
         [
             swapchain.dimensions()[0] as _,
@@ -416,9 +402,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         &render_pass,
     )?;
 
-    let framebuffers: Vec<_> = create_framebuffers(&swapchain_images, &render_pass)?;
-    let command_buffers: Vec<_> =
-        create_command_buffer(&framebuffers, &device, &graphics_queue, &graphics_pipeline)?;
+    let mut framebuffers: Vec<_> = create_framebuffers(&swapchain_images, &render_pass)?;
+    let mut command_buffers: Vec<_> =
+        create_command_buffers(&framebuffers, &device, &graphics_queue, &graphics_pipeline)?;
+
+    let mut prev_future: Option<Box<dyn GpuFuture>> = None;
+    let mut request_recreate_swapchain = false;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -429,25 +418,111 @@ fn main() -> Result<(), Box<dyn Error>> {
             } => {
                 *control_flow = ControlFlow::Exit;
             }
+            Event::WindowEvent {
+                event: WindowEvent::Resized(_),
+                ..
+            } => {
+                request_recreate_swapchain = true;
+            }
             Event::MainEventsCleared => {
                 surface.window().request_redraw();
             }
             Event::RedrawRequested(_) => {
-                if let Ok((image_index, _, acquire_future)) =
-                    acquire_next_image(swapchain.clone(), None)
-                {
-                    let command_buffer = command_buffers[image_index].clone();
-                    if let Ok(future) =
-                        acquire_future.then_execute(graphics_queue.clone(), command_buffer)
-                    {
-                        let _ = future
-                            .then_swapchain_present(
-                                present_queue.clone(),
-                                swapchain.clone(),
-                                image_index,
+                if let Some(ref mut prev_future) = prev_future {
+                    prev_future.cleanup_finished();
+                }
+
+                match acquire_next_image(swapchain.clone(), None) {
+                    Ok((image_index, suboptimal, acquire_future)) => {
+                        let command_buffer = command_buffers[image_index].clone();
+                        let future: Box<dyn GpuFuture> =
+                            if let Some(prev_future) = prev_future.take() {
+                                Box::new(prev_future.join(acquire_future))
+                            } else {
+                                Box::new(acquire_future)
+                            };
+                        if let Ok(future) =
+                            future.then_execute(graphics_queue.clone(), command_buffer)
+                        {
+                            let future = future
+                                .then_swapchain_present(
+                                    present_queue.clone(),
+                                    swapchain.clone(),
+                                    image_index,
+                                )
+                                .then_signal_fence_and_flush();
+                            match future {
+                                Ok(future) => {
+                                    prev_future = Some(Box::new(future));
+                                }
+                                Err(FlushError::OutOfDate) => {
+                                    request_recreate_swapchain = true;
+                                    prev_future = Some(Box::new(sync::now(device.clone())));
+                                }
+                                Err(e) => {
+                                    eprintln!("{}", e);
+                                    prev_future = None;
+                                }
+                            }
+                        }
+                        if suboptimal {
+                            request_recreate_swapchain = true;
+                        }
+                    }
+                    Err(AcquireError::OutOfDate) => {
+                        request_recreate_swapchain = true;
+                        prev_future = Some(Box::new(sync::now(device.clone())));
+                    }
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        prev_future = None;
+                    }
+                }
+
+                if request_recreate_swapchain {
+                    request_recreate_swapchain = false;
+                    let result = swapchain
+                        .recreate()
+                        .map_err(|e| e.to_string())
+                        .and_then(|(new_swapchain, new_swapchain_images)| {
+                            swapchain = new_swapchain;
+                            swapchain_images = new_swapchain_images;
+                            create_render_pass(&device, swapchain.format())
+                                .map_err(|e| e.to_string())
+                        })
+                        .and_then(|new_render_pass| {
+                            render_pass = new_render_pass;
+                            create_graphics_pipeline(
+                                &device,
+                                [
+                                    swapchain.dimensions()[0] as _,
+                                    swapchain.dimensions()[1] as _,
+                                ],
+                                &render_pass,
                             )
-                            .then_signal_fence_and_flush()
-                            .and_then(|future| future.wait(None));
+                            .map_err(|e| e.to_string())
+                        })
+                        .and_then(|new_graphics_pipeline| {
+                            graphics_pipeline = new_graphics_pipeline;
+                            create_framebuffers(&swapchain_images, &render_pass)
+                                .map_err(|e| e.to_string())
+                        })
+                        .and_then(|new_framebuffers| {
+                            framebuffers = new_framebuffers;
+                            create_command_buffers(
+                                &framebuffers,
+                                &device,
+                                &graphics_queue,
+                                &graphics_pipeline,
+                            )
+                            .map_err(|e| e.to_string())
+                        })
+                        .and_then(|new_command_buffers| {
+                            command_buffers = new_command_buffers;
+                            Ok(())
+                        });
+                    if let Err(msg) = result {
+                        eprintln!("{}", msg);
                     }
                 }
             }
