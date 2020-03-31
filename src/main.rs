@@ -376,7 +376,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     print_layers_list();
 
     let instance = create_vulkan_instance()?;
-    let _ = match register_debug_callback(&instance) {
+    let _debug_callback = match register_debug_callback(&instance) {
         Some(result) => Some(result?),
         None => None, // None for release mode
     };
