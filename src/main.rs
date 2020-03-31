@@ -120,10 +120,17 @@ fn register_debug_callback(
         } else {
             "performance"
         };
-        eprintln!(
-            "{} (type: {}) (layer: {}): {}",
-            severity, ty, message.layer_prefix, message.description
-        );
+        // suppress "outside the bounds" error caused by swapchain creation
+        if !(message.severity.error
+            && message.ty.validation
+            && message.layer_prefix.contains("VkSwapchainCreateInfoKHR")
+            && message.description.contains("outside the bounds"))
+        {
+            eprintln!(
+                "{} (type: {}) (layer: {}): {}",
+                severity, ty, message.layer_prefix, message.description
+            );
+        }
     }))
 }
 
